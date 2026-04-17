@@ -2,6 +2,7 @@ package lime.ui;
 
 import haxe.io.Bytes;
 import haxe.io.Path;
+import haxe.ds.Map;
 import lime._internal.backend.native.NativeCFFI;
 import lime.app.Event;
 import lime.graphics.Image;
@@ -84,13 +85,33 @@ class FileDialog #if android implements JNISafety #end
 	private static final SAVE_REQUEST_CODE:Int = JNI.createStaticField('org/haxe/lime/FileDialog', 'SAVE_REQUEST_CODE', 'I').get();
 	private static final DOCUMENT_TREE_REQUEST_CODE:Int = JNI.createStaticField('org/haxe/lime/FileDialog', 'DOCUMENT_TREE_REQUEST_CODE', 'I').get();
 	private static final RESULT_OK:Int = -1;
+	
 	private var JNI_FILE_DIALOG:Dynamic = null;
+	#end
+
+	#if android
+	private static final OPEN_REQUEST_CODE:Int = JNI.createStaticField('org/haxe/lime/FileDialog', 'OPEN_REQUEST_CODE', 'I').get();
+	private static final OPEN_MULTIPLE_REQUEST_CODE:Int = JNI.createStaticField('org/haxe/lime/FileDialog', 'OPEN_MULTIPLE_REQUEST_CODE', 'I').get();
+	private static final SAVE_REQUEST_CODE:Int = JNI.createStaticField('org/haxe/lime/FileDialog', 'SAVE_REQUEST_CODE', 'I').get();
+	private static final DOCUMENT_TREE_REQUEST_CODE:Int = JNI.createStaticField('org/haxe/lime/FileDialog', 'DOCUMENT_TREE_REQUEST_CODE', 'I').get();
+	private static final RESULT_OK:Int = -1;
+	private var JNI_FILE_DIALOG:Dynamic = null;
+	private var IS_SELECT:Bool = false;
+	#elseif ios
+	private static var registeredEvents:Bool = false;
+	private static var eventHandler:FileDialogEventHanlder;
+	private static var fileDialogInstances:Map<Int, FileDialog> = new Map<Int, FileDialog>();
+	private var native_id:Int = -1;
 	#end
 
 	public function new()
 	{
 		#if android
 		JNI_FILE_DIALOG = JNI.createStaticMethod('org/haxe/lime/FileDialog', 'createInstance', '(Lorg/haxe/lime/HaxeObject;)Lorg/haxe/lime/FileDialog;')(this);
+		#elseif ios
+		eventHandler = new FileDialogEventHanlder();
+		native_id = NativeCFFI.lime_file_dialog_create_ios();
+		fileDialogInstances.set(native_id, this);
 		#end
 	}
 
@@ -261,6 +282,42 @@ class FileDialog #if android implements JNISafety #end
 				save(null, filter, defaultPath, title, 'application/octet-stream');
 		}
 		return true;
+		#elseif android
+		IS_SELECT = true;
+		switch (type)
+		{
+			case OPEN:
+				filter = StringTools.replace(filter, " ", "");
+				JNI.callMember(JNI.createMemberMethod('org/haxe/lime/FileDialog', 'open', '(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V'), JNI_FILE_DIALOG, [filter, defaultPath, title]);
+				return true;
+
+			case OPEN_MULTIPLE:
+				filter = StringTools.replace(filter, " ", "");
+				JNI.callMember(JNI.createMemberMethod('org/haxe/lime/FileDialog', 'openMultiple', '(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V'), JNI_FILE_DIALOG, [filter, defaultPath, title]);
+				return true;
+
+			case OPEN_DIRECTORY:
+				JNI.callMember(JNI.createMemberMethod('org/haxe/lime/FileDialog', 'openDocumentTree', '(Ljava/lang/String;)V'), JNI_FILE_DIALOG, [null]);
+				return true;
+
+			case SAVE:
+				save(null, filter, defaultPath, title, 'application/octet-stream');
+				return true;
+		}
+		return true;
+		#elseif ios
+		switch (type)
+		{
+			case OPEN:
+				NativeCFFI.lime_file_dialog_browse_select_ios(native_id);
+				return true;
+			case OPEN_MULTIPLE:
+				NativeCFFI.lime_file_dialog_browse_select_multiple_ios(native_id);
+				return true;
+			default:
+				onCancel.dispatch();
+				return false;
+		}
 		#else
 		onCancel.dispatch();
 		return false;
@@ -322,9 +379,11 @@ class FileDialog #if android implements JNISafety #end
 
 		return true;
 		#elseif android
+		filter = StringTools.replace(filter, " ", "");
 		JNI.callMember(JNI.createMemberMethod('org/haxe/lime/FileDialog', 'open', '(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V'), JNI_FILE_DIALOG, [filter, defaultPath, title]);
 		return true;
-		#else
+		#elseif ios
+		NativeCFFI.lime_file_dialog_open_ios(native_id);
 		onCancel.dispatch();
 		return false;
 		#end
@@ -464,8 +523,11 @@ class FileDialog #if android implements JNISafety #end
 
 	#if android
 	@:runOnMainThread
-	private function jni_activity_results(requestCode:Int, resultCode:Int, uri:String, path:String, data:Dynamic)
+	@:keep
+	private function onJNIActivityResult(requestCode:Int, resultCode:Int, uri:String, path:String)
 	{
+		// trace('onJNIActivityResults: requestCode: ${Std.string(requestCode)}, resultCode: ${Std.string(resultCode)}, uri: $uri, path: $path');
+
 		if (resultCode == RESULT_OK)
 		{
 			switch (requestCode)
@@ -473,27 +535,127 @@ class FileDialog #if android implements JNISafety #end
 				case OPEN_REQUEST_CODE:
 					try
 					{
-						onOpen.dispatch(Bytes.ofData(data));
+						if (IS_SELECT)
+							onSelect.dispatch(path);
+						else
+							onOpen.dispatch(File.getBytes(path));
 					}
-					catch (e:Dynamic) {}
+					catch (e:Dynamic)
+					{
+						if (IS_SELECT)
+							trace('Failed to dispatch onSelect: $e');
+						else
+							trace('Failed to dispatch onOpen: $e');
+					}
+				case OPEN_MULTIPLE_REQUEST_CODE:
+					try
+					{
+						var paths:Array<String> = StringTools.contains(path, ",") ? path.split(',') : [path];
+						if (paths == null || paths.contains(null) || paths.length <= 0) throw "Got null paths array";
+						onSelectMultiple.dispatch(paths);
+					}
+					catch (e:Dynamic)
+					{
+						trace('Failed to dispatch onSelectMultiple: $e');
+					}
 				case SAVE_REQUEST_CODE:
 					try
 					{
-						onSave.dispatch(path);
+						if (IS_SELECT)
+							onSelect.dispatch(path);
+						else
+							onSave.dispatch(path);
 					}
-					catch (e:Dynamic) {}
-				case DOCUMENT_TREE_REQUEST_CODE:
-					try
+					catch (e:Dynamic)
 					{
-						onSelect.dispatch(uri);
+						if (IS_SELECT)
+							trace('Failed to dispatch onSelect: $e');
+						else
+							trace('Failed to dispatch onSave: $e');
 					}
-					catch (e:Dynamic) {}
+				case DOCUMENT_TREE_REQUEST_CODE:
+					trace("Directory select doesn't work yet.");
+					onCancel.dispatch();
+					// try
+					// {
+					// 	onSelect.dispatch(uri);
+					// }
+					// catch (e:Dynamic)
+					// {
+					// 	trace('Failed to dispatch onSelect: $e');
+					// }
 			}
 		}
 		else
-		{
 			onCancel.dispatch();
-		}
+		IS_SELECT = false;
 	}
 	#end
 }
+
+#if ios
+@:access(lime._internal.backend.native.NativeCFFI)
+@:access(lime.ui.FileDialog)
+private class FileDialogEventHanlder
+{
+	public var fileDialogEventInfo:FileDialogEventInfo;
+
+	public function new()
+	{
+		fileDialogEventInfo = new FileDialogEventInfo(FILE_DIALOG_EVENT, "", -1);
+		NativeCFFI.lime_file_dialog_manager_register_ios(handleFileDialogEvent, fileDialogEventInfo);
+	}
+
+	private function handleFileDialogEvent():Void
+	{
+		if (!FileDialog.fileDialogInstances.exists(fileDialogEventInfo.id)) return;
+		
+		var FileDialogInstance = FileDialog.fileDialogInstances.get(fileDialogEventInfo.id);
+		var file:String = fileDialogEventInfo.file;
+
+		switch (fileDialogEventInfo.type)
+		{
+			case FILE_OPEN_SUCCESS:
+				FileDialogInstance.onOpen.dispatch(File.getBytes(file));
+			case FILE_BROWSE_SELECT:
+				FileDialogInstance.onSelect.dispatch(file);
+			case FILE_BROWSE_SELECT_MULTIPLE:
+				FileDialogInstance.onSelectMultiple.dispatch(file.split(','));
+			case FILE_OPEN_ERROR | FILE_OPEN_CANCELED | FILE_SAVE_CANCELED | FILE_SAVE_ERROR:
+				FileDialogInstance.onCancel.dispatch();
+			default:
+		}
+	}
+}
+
+@:keep
+private class FileDialogEventInfo
+{
+	public var id:Int;
+	public var file:String;
+	public var type:FileDialogEventType;
+
+	public function new(type:FileDialogEventType = null, file:String, id:Int)
+	{
+		this.type = type;
+	}
+
+	public function clone():FileDialogEventInfo
+	{
+		return new FileDialogEventInfo(type, file, id);
+	}
+}
+
+#if (haxe_ver >= 4.0) private enum #else @:enum private #end abstract FileDialogEventType(Int)
+{
+	var FILE_OPEN_SUCCESS = 0;
+	var FILE_OPEN_CANCELED = 1;
+	var FILE_OPEN_ERROR = 2;
+	var FILE_BROWSE_SELECT = 3;
+	var FILE_BROWSE_SELECT_MULTIPLE = 4;
+	var FILE_SAVE_SUCCESS = 5;
+	var FILE_SAVE_CANCELED = 6;
+	var FILE_SAVE_ERROR = 7;
+	var FILE_DIALOG_EVENT = 8;
+}
+#end
